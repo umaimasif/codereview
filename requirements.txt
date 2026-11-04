@@ -1,0 +1,6 @@
+langgraph
+langchain-groq
+langchain-core
+pydantic>=2
+requests
+python-dotenv
