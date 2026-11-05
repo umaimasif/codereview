@@ -1,8 +1,8 @@
 """
-AI Code Review Assistant (LangGraph + Groq)
+AI Code Review Assistant (LangGraph + Groq) - Streamlit version
 
-Input : a GitHub PR URL, a .diff/.patch file path, or "-" to read a diff from stdin
-Output: a Markdown report with comments, risk flags, and suggestions
+How to use: paste a GitHub Pull Request link into the input box and click "Review this PR".
+Secrets (GROQ_API_KEY, GITHUB_TOKEN, APP_PASSWORD) go in Streamlit Secrets, NOT the PR link.
 
 Graph:
     fetch_diff --> split_diff --> review_files --> summarize --> END
@@ -10,25 +10,36 @@ Graph:
          +--(error / empty diff)--> END
 """
 
-import argparse
 import os
 import re
-import sys
 from typing import List, Literal, TypedDict
 
 import requests
+import streamlit as st
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_groq import ChatGroq
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field
 
-load_dotenv()
+st.set_page_config(page_title="AI Code Review", page_icon="🤖", layout="centered")
 
-MODEL_NAME = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+load_dotenv()  # local development: reads the .env file
+
+
+def get_secret(name: str, default=None):
+    """Read from Streamlit Secrets first, then from environment / .env."""
+    try:
+        return st.secrets[name]
+    except Exception:
+        return os.getenv(name, default)
+
+
+MODEL_NAME = get_secret("GROQ_MODEL", "openai/gpt-oss-120b")
 MAX_FILES = 15
 MAX_CHARS_PER_FILE = 12_000  # keep prompts small so we stay under token limits
 SKIP_FILES = (".lock", "package-lock.json", "yarn.lock", ".min.js", ".svg", ".png", ".jpg")
+PR_PATTERN = re.compile(r"^https://github\.com/([\w.-]+)/([\w.-]+)/pull/(\d+)")
 
 Severity = Literal["low", "medium", "high"]
 
@@ -68,8 +79,10 @@ class ReviewState(TypedDict, total=False):
 
 
 def get_llm() -> ChatGroq:
-    if not os.getenv("GROQ_API_KEY"):
-        raise RuntimeError("GROQ_API_KEY is missing. Put it in your .env file.")
+    api_key = get_secret("GROQ_API_KEY")
+    if not api_key:
+        raise RuntimeError("GROQ_API_KEY is missing. Add it to Streamlit Secrets or .env.")
+    os.environ["GROQ_API_KEY"] = api_key
     return ChatGroq(model=MODEL_NAME, temperature=0)
 
 
@@ -77,31 +90,26 @@ def get_llm() -> ChatGroq:
 # 3) Nodes
 # ----------------------------------------------------------------------------
 def fetch_diff(state: ReviewState) -> ReviewState:
-    """Get the raw diff text from a PR URL, a file, or stdin."""
+    """Get the raw diff text from a GitHub PR URL."""
     source = state["source"]
+    match = PR_PATTERN.match(source)
+    if not match:
+        return {"error": "That is not a Pull Request link. Use one like https://github.com/owner/repo/pull/1"}
+
+    owner, repo, number = match.groups()
+    url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}"
+    headers = {"Accept": "application/vnd.github.v3.diff"}
+    token = get_secret("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
 
     try:
-        if source == "-":
-            return {"diff": sys.stdin.read()}
-
-        if os.path.isfile(source):
-            with open(source, "r", encoding="utf-8", errors="replace") as f:
-                return {"diff": f.read()}
-
-        match = re.match(r"https?://github\.com/([^/]+)/([^/]+)/pull/(\d+)", source)
-        if match:
-            owner, repo, number = match.groups()
-            url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}"
-            headers = {"Accept": "application/vnd.github.v3.diff"}
-            token = os.getenv("GITHUB_TOKEN")
-            if token:
-                headers["Authorization"] = f"Bearer {token}"
-            resp = requests.get(url, headers=headers, timeout=30)
-            resp.raise_for_status()
-            return {"diff": resp.text}
-
-        return {"error": f"Don't know how to read source: {source}"}
-    except Exception as e:  # network errors, bad file, 404, etc.
+        resp = requests.get(url, headers=headers, timeout=30)
+        if resp.status_code == 404:
+            return {"error": "PR not found. Check the link, or the repo may be private (add a GITHUB_TOKEN)."}
+        resp.raise_for_status()
+        return {"diff": resp.text}
+    except Exception as e:  # network errors, rate limits, etc.
         return {"error": f"Failed to fetch diff: {e}"}
 
 
@@ -129,7 +137,7 @@ def split_diff(state: ReviewState) -> ReviewState:
 
     if not chunks:
         return {"error": "No reviewable files found in the diff."}
-        return {"file_chunks": chunks[:MAX_FILES]}
+    return {"file_chunks": chunks[:MAX_FILES]}
 
 
 REVIEW_SYSTEM_PROMPT = """You are a senior software engineer doing a code review.
@@ -152,7 +160,6 @@ def review_files(state: ReviewState) -> ReviewState:
     reviews = []
 
     for chunk in state["file_chunks"]:
-        print(f"  reviewing {chunk['filename']} ...", file=sys.stderr)
         try:
             result: FileReview = structured_llm.invoke(
                 [
@@ -175,9 +182,11 @@ def review_files(state: ReviewState) -> ReviewState:
                     },
                 }
             )
-        if all("Could not review" in r["review"]["summary"] for r in reviews):
-              return {"error": reviews[0]["review"]["summary"]}
-         return {"reviews": reviews}
+
+    # If EVERY file failed, show a real error instead of a fake report
+    if all("Could not review" in r["review"]["summary"] for r in reviews):
+        return {"error": reviews[0]["review"]["summary"]}
+    return {"reviews": reviews}
 
 
 RANK = {"low": 0, "medium": 1, "high": 2}
@@ -267,28 +276,63 @@ def build_graph():
     return g.compile()
 
 
+@st.cache_resource
+def get_graph():
+    return build_graph()
+
+
 # ----------------------------------------------------------------------------
-# 5) Command line
+# 5) The web page (Streamlit)
 # ----------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="AI code review for a PR diff")
-    parser.add_argument("source", help="GitHub PR URL, path to .diff file, or '-' for stdin")
-    parser.add_argument("--out", help="Save the report to this Markdown file")
-    args = parser.parse_args()
+    st.title("🤖 AI Code Review")
+    st.write("Paste a GitHub Pull Request link and get comments, risk flags, and suggestions.")
 
-    app = build_graph()
-    final = app.invoke({"source": args.source})
+    # Optional password gate: add APP_PASSWORD to Streamlit Secrets to turn it on
+    app_password = get_secret("APP_PASSWORD")
+    if app_password:
+        typed = st.text_input("Password", type="password")
+        if typed != app_password:
+            st.info("Enter the password to use this app.")
+            st.stop()
 
-    if final.get("error"):
-        print(f"Error: {final['error']}", file=sys.stderr)
-        sys.exit(1)
+    pr_url = st.text_input(
+        "GitHub Pull Request link",
+        placeholder="https://github.com/owner/repo/pull/1",
+    ).strip()
 
-    print(final["report"])
-    if args.out:
-        with open(args.out, "w", encoding="utf-8") as f:
-            f.write(final["report"])
-        print(f"\nSaved to {args.out}", file=sys.stderr)
+    if st.button("Review this PR", type="primary"):
+        st.session_state.pop("report", None)
+        if not pr_url:
+            st.warning("Please paste a Pull Request link first.")
+        elif not PR_PATTERN.match(pr_url):
+            st.error(
+                "That is not a Pull Request link. It must look like "
+                "`https://github.com/owner/repo/pull/1`. A normal repo link will not work, "
+                "because this tool reviews the changes inside a PR."
+            )
+        else:
+            with st.spinner("Reviewing your PR... this can take a minute."):
+                try:
+                    result = get_graph().invoke({"source": pr_url})
+                except Exception as e:
+                    st.error(f"Something went wrong: {e}")
+                    st.stop()
+
+            if result.get("error"):
+                st.error(result["error"])
+            else:
+                st.session_state["report"] = result["report"]
+
+    # Show the saved report (stays visible after clicking the download button)
+    if "report" in st.session_state:
+        st.markdown(st.session_state["report"])
+        st.download_button(
+            "⬇️ Download report (.md)",
+            data=st.session_state["report"],
+            file_name="review.md",
+            mime="text/markdown",
+        )
 
 
-if __name__ == "__main__":
-    main()
+main()
