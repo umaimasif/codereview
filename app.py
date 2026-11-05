@@ -129,7 +129,7 @@ def split_diff(state: ReviewState) -> ReviewState:
 
     if not chunks:
         return {"error": "No reviewable files found in the diff."}
-    return {"file_chunks": chunks}
+        return {"file_chunks": chunks[:MAX_FILES]}
 
 
 REVIEW_SYSTEM_PROMPT = """You are a senior software engineer doing a code review.
@@ -175,7 +175,9 @@ def review_files(state: ReviewState) -> ReviewState:
                     },
                 }
             )
-    return {"reviews": reviews}
+        if all("Could not review" in r["review"]["summary"] for r in reviews):
+              return {"error": reviews[0]["review"]["summary"]}
+         return {"reviews": reviews}
 
 
 RANK = {"low": 0, "medium": 1, "high": 2}
