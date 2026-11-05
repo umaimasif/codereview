@@ -26,6 +26,7 @@ from pydantic import BaseModel, Field
 load_dotenv()
 
 MODEL_NAME = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+MAX_FILES = 15
 MAX_CHARS_PER_FILE = 12_000  # keep prompts small so we stay under token limits
 SKIP_FILES = (".lock", "package-lock.json", "yarn.lock", ".min.js", ".svg", ".png", ".jpg")
 
